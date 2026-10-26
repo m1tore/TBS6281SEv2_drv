@@ -1,0 +1,11 @@
+# Linuxカーネルモジュールのビルド生成物
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+.tmp_versions/
+.*.cmd
+.cache.mk
