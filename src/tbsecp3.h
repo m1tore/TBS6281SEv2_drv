@@ -43,6 +43,7 @@
 #define TBSECP3_DMA_ADDRH	0x0008
 #define TBSECP3_DMA_ADDRL	0x000c
 #define TBSECP3_DMA_BSIZE	0x0010
+#define TBSECP3_DMA_TLV_UNK	0x0014
 
 // 割り込みコントローラレジスタ定義
 #define TBSECP3_INT_BASE	0xc000
@@ -166,6 +167,8 @@ struct tbsecp3_adapter {
 	struct mutex lock;
 	bool is_open;
 	bool streaming;
+	// TLV生データストリームフラグ
+	bool is_raw_stream;
 	struct tbs6281_ringbuffer ringbuf;
 };
 

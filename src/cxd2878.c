@@ -41,15 +41,17 @@ struct cxd2878_dev {
 	u32 current_freq_hz;
 	u16 isdbc_tsmf_slot;
 	bool isdbc_256qam_pass;
+	// 実験用生ストリームモードフラグ
+	bool is_j183;
 };
 
-
 // ISDB-CおよびISDB-T復調微調整用モジュールパラメータ群
-static int isdbc_offset_khz;
+static int isdbc_offset_khz = 0;
 module_param(isdbc_offset_khz, int, 0644);
-static int isdbc_fif_offset = -2;
+MODULE_PARM_DESC(isdbc_offset_khz, "ISDB-C frequency offset in kHz, default 0");
+static int isdbc_fif_offset = -6;
 module_param(isdbc_fif_offset, int, 0644);
-static int isdbc_bw_offset = -2;
+static int isdbc_bw_offset = -4;
 module_param(isdbc_bw_offset, int, 0644);
 static int isdbc_if_gc = 0;
 module_param(isdbc_if_gc, int, 0644);
@@ -63,7 +65,7 @@ static int isdbc_rfovld = -1;
 module_param(isdbc_rfovld, int, 0644);
 static int isdbc_ifovld = -1;
 module_param(isdbc_ifovld, int, 0644);
-static int isdbc_outlmt = -1;
+static int isdbc_outlmt = 1;
 module_param(isdbc_outlmt, int, 0644);
 static int isdbc_terr_tune = 0;
 module_param(isdbc_terr_tune, int, 0644);
@@ -982,10 +984,10 @@ err:
 	return ret;
 }
 
-// TSストリーム出力の有効化および無効化
+// ストリーム出力の有効化および無効化
 static int cxd2878_setstreamoutput(struct cxd2878_dev *dev, int enable)
 {
-	int ret;
+	int ret = 0;
 	u8 data = 0;
 
 	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
@@ -995,6 +997,27 @@ static int cxd2878_setstreamoutput(struct cxd2878_dev *dev, int enable)
 	if (ret)
 		goto err;
 
+	// TLV出力有効化
+	if ((data & 0x03) == 0x01) {
+		ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x01);
+		if (ret)
+			goto err;
+		ret = cxd2878_wr(dev, dev->slvt, 0xC0, enable ? 0x00 : 0x01);
+		if (ret)
+			goto err;
+	}
+
+	// ALP出力有効化
+	if ((data & 0x03) == 0x02) {
+		ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x02);
+		if (ret)
+			goto err;
+		ret = cxd2878_wr(dev, dev->slvt, 0xC0, enable ? 0x00 : 0x01);
+		if (ret)
+			goto err;
+	}
+
+	// TS出力有効化
 	if ((data & 0x03) == 0x00) {
 		ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
 		if (ret)
@@ -1003,6 +1026,11 @@ static int cxd2878_setstreamoutput(struct cxd2878_dev *dev, int enable)
 		if (ret)
 			goto err;
 	}
+
+	// レジスタバンク復帰
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
+	if (ret)
+		goto err;
 	return 0;
 err:
 	dev_err(&dev->base->i2c->dev, "%s: cxd2878_setstreamoutput error\n", KBUILD_MODNAME);
@@ -1050,6 +1078,7 @@ static int cxd2878_setTSClkModeAndFreq(struct cxd2878_dev *dev)
 	    dev->system == SONY_DTV_SYSTEM_ATSC)
 		tsRateCtrlOff = 1;
 
+	// 高度放送生ストリーム受信時のレート制御と入力設定
 	cxd2878_SetRegisterBits(dev, dev->slvt, 0xD3, tsRateCtrlOff, 0x01);
 	cxd2878_SetRegisterBits(dev, dev->slvt, 0xDE, 0x00, 0x01);
 	cxd2878_SetRegisterBits(dev, dev->slvt, 0xDA, 0x00, 0x01);
@@ -1083,6 +1112,15 @@ static int cxd2878_setTSClkModeAndFreq(struct cxd2878_dev *dev)
 	if (ret)
 		goto err;
 	cxd2878_SetRegisterBits(dev, dev->slvt, 0x66, 0x01, 0x01);
+
+	// チャネルボンディングおよびパラレル出力設定
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x01);
+	if (ret)
+		goto err;
+	cxd2878_SetRegisterBits(dev, dev->slvt, 0xE7, 0x01, 0x01);
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
+	if (ret)
+		goto err;
 
 	return 0;
 err:
@@ -1203,6 +1241,8 @@ static int cxd2878_sleep_unlocked(struct cxd2878_dev *dev)
 			cxd2878_wr(dev, dev->slvt, 0xA3, 0x00);
 			cxd2878_wr(dev, dev->slvt, 0x00, 0x48);
 			cxd2878_wr(dev, dev->slvt, 0x2C, 0x01);
+			// スリープ遷移時にRSエラー時のTS出力ゲート初期値を復元
+			cxd2878_wr(dev, dev->slvt, 0xAC, 0x30);
 			cxd2878_wr(dev, dev->slvt, 0x00, 0x40);
 			cxd2878_wr(dev, dev->slvt, 0x14, 0x1F);
 			cxd2878_wr(dev, dev->slvt, 0x1E, 0x00);
@@ -1426,10 +1466,11 @@ static int SLtoAIC_BandAndTSMFSetting(struct cxd2878_dev *dev)
 	cxd2878_wr(dev, dev->slvt, 0xA3, 0x14);
 
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x40);
+	// CATVおよび高度CATV向け標準シンボルレート設定
 	cxd2878_wrm(dev, dev->slvt, 0x26, symRate_6, 4);
 
 	if (dev->isdbc_256qam_pass || dev->isdbc_tsmf_slot == 0) {
-		// 64QAMおよび256QAM自動追従とTSMFスルー出力を設定
+		// 全QAM自動追従とTSMFスルー出力を設定
 		cxd2878_wr(dev, dev->slvt, 0x14, 0x14);
 		cxd2878_wr(dev, dev->slvt, 0x1E, 0x00);
 	} else {
@@ -1451,6 +1492,15 @@ static int SLtoAIC_BandAndTSMFSetting(struct cxd2878_dev *dev)
 			cxd2878_SetRegisterBits(dev, dev->slvt, 0x36, 0x20, 0x3F);
 		}
 	}
+
+	// TSクロックマスクと標準TS出力設定
+	cxd2878_SetBankAndRegisterBits(dev, dev->slvt, 0x00, 0xC6,
+				       dev->is_j183 ? 0x00 : dev->base->config->ts_clk_mask, 0x1F);
+	cxd2878_SetBankAndRegisterBits(dev, dev->slvt, 0x00, 0xA9, 0x00, 0x03);
+	// 生ストリーム時の同期入力バイパスとクロック常時出力設定
+	cxd2878_SetBankAndRegisterBits(dev, dev->slvt, 0x00, 0xDE, 0x00, 0x01);
+	cxd2878_SetBankAndRegisterBits(dev, dev->slvt, 0x00, 0xDA,
+				       dev->is_j183 ? 0x01 : 0x00, 0x01);
 
 	return 0;
 err:
@@ -1488,6 +1538,8 @@ static int SLtoAIC(struct cxd2878_dev *dev)
 	cxd2878_wrm(dev, dev->slvt, 0x33, datax33, 3);
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x48);
 	cxd2878_wr(dev, dev->slvt, 0x2C, 0x03);
+	// RSエラー発生時のTS出力ミュートゲートを解除してTSロックを維持
+	cxd2878_wr(dev, dev->slvt, 0xAC, 0x00);
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
 	cxd2878_wrm(dev, dev->slvt, 0xCE, dataxce, 2);
 
@@ -1499,6 +1551,10 @@ static int SLtoAIC(struct cxd2878_dev *dev)
 	cxd2878_SetRegisterBits(dev, dev->slvt, 0x80, 0x08, 0x1F);
 
 	ret = cxd2878_setTSDataPinHiZ(dev, 0);
+	if (ret)
+		goto err;
+
+	ret = cxd2878_setstreamoutput(dev, 1);
 	if (ret)
 		goto err;
 
@@ -1670,7 +1726,6 @@ int cxd2878_tune_isdbt(struct cxd2878_dev *dev, u32 freq_hz)
 		goto err;
 
 	mutex_unlock(&dev->base->i2c_lock);
-	msleep(20);
 	return 0;
 
 err:
@@ -1686,10 +1741,10 @@ int cxd2878_tune_isdbc(struct cxd2878_dev *dev, u32 freq_hz,
 {
 	int ret = 0;
 
-	freq_hz += isdbc_offset_khz * 1000;
-
 	if (!dev)
 		return -EINVAL;
+
+	freq_hz += isdbc_offset_khz * 1000;
 
 	mutex_lock(&dev->base->i2c_lock);
 
@@ -1711,15 +1766,18 @@ int cxd2878_tune_isdbc(struct cxd2878_dev *dev, u32 freq_hz,
 	dev->isdbc_tsmf_slot = tsmf_slot_or_tsid;
 	dev->isdbc_256qam_pass = is_256qam_pass;
 
-	if (dev->state == SONY_DEMOD_STATE_ACTIVE && dev->system == SONY_DTV_SYSTEM_ISDBC) {
-		ret |= cxd2878_setstreamoutput(dev, 0);
-		ret |= SLtoAIC_BandAndTSMFSetting(dev);
-	} else if (dev->state == SONY_DEMOD_STATE_ACTIVE && dev->system != SONY_DTV_SYSTEM_ISDBC) {
+	// ISDB-C標準復調選局
+	if (dev->state == SONY_DEMOD_STATE_ACTIVE && dev->system != SONY_DTV_SYSTEM_ISDBC)
 		cxd2878_sleep_unlocked(dev);
-		dev->system = SONY_DTV_SYSTEM_ISDBC;
-		ret = SLtoAIC(dev);
+	dev->system = SONY_DTV_SYSTEM_ISDBC;
+	dev->bandwidth = SONY_DTV_BW_6_MHZ;
+	if (dev->state == SONY_DEMOD_STATE_ACTIVE) {
+		ret |= cxd2878_setstreamoutput(dev, 0);
+		// アクティブ再選局時もRSエラー時のTS出力ゲート解除を適用
+		cxd2878_wr(dev, dev->slvt, 0x00, 0x48);
+		cxd2878_wr(dev, dev->slvt, 0xAC, 0x00);
+		ret |= SLtoAIC_BandAndTSMFSetting(dev);
 	} else {
-		dev->system = SONY_DTV_SYSTEM_ISDBC;
 		ret = SLtoAIC(dev);
 	}
 	if (ret)
@@ -1739,7 +1797,6 @@ int cxd2878_tune_isdbc(struct cxd2878_dev *dev, u32 freq_hz,
 		goto err;
 
 	mutex_unlock(&dev->base->i2c_lock);
-	msleep(20);
 	return 0;
 
 err:
@@ -1780,6 +1837,7 @@ int cxd2878_read_status(struct cxd2878_dev *dev, bool *is_locked)
 		ret = cxd2878_rdm(dev, dev->slvt, 0x88, &data, 1);
 		if (ret || !(data & 0x01))
 			goto out;
+
 		ret = cxd2878_rdm(dev, dev->slvt, 0x10, &data, 1);
 		if (ret || !(data & 0x20))
 			goto out;
@@ -2143,3 +2201,19 @@ err1:
 	kfree(dev);
 	return NULL;
 }
+
+// J.183または生ストリームモード判定関数
+bool cxd2878_is_j183(struct cxd2878_dev *dev)
+{
+	if (!dev)
+		return false;
+	return dev->is_j183;
+}
+
+// J.183または生ストリームモード設定関数
+void cxd2878_set_j183(struct cxd2878_dev *dev, bool enable)
+{
+	if (dev)
+		dev->is_j183 = enable;
+}
+

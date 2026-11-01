@@ -288,6 +288,8 @@ static int tbs6281_set_channel(struct tbsecp3_adapter *adapter,
 				return ret;
 			tbs6281_wait_lock(adapter->fe, 700);
 		}
+		// 選局完了後に生ストリーム判定フラグを更新
+		adapter->is_raw_stream = cxd2878_is_j183(adapter->fe);
 		return 0;
 	}
 
@@ -313,14 +315,29 @@ static int tbs6281_set_channel(struct tbsecp3_adapter *adapter,
 			base_freq_hz = (225 + (freq->freq_no - 22) * 6) * 1000000U;
 		}
 
-		if (freq->slot > 10000000) {
+		if (freq->slot == -2) {
+			// 実験用の生ストリームモードによるCATV選局
+			adapter->is_raw_stream = true;
+			cxd2878_set_j183(adapter->fe, true);
+			ret = cxd2878_tune_isdbc(adapter->fe, base_freq_hz, 0, true);
+			if (ret)
+				return ret;
+			tbs6281_wait_lock(adapter->fe, 700);
+			return 0;
+		} else if (freq->slot > 10000000) {
 			// 直接指定された周波数でISDB-C選局
-			ret = cxd2878_tune_isdbc(adapter->fe, (u32)freq->slot, 0, true);
+			u32 direct_freq = (u32)freq->slot;
+
+			adapter->is_raw_stream = false;
+			cxd2878_set_j183(adapter->fe, false);
+			ret = cxd2878_tune_isdbc(adapter->fe, direct_freq, 0, true);
 			if (ret)
 				return ret;
 			tbs6281_wait_lock(adapter->fe, 700);
 		} else if (freq->slot <= 0) {
 			// CATV帯域の全QAM自動追従ISDB-Cスルー選局
+			adapter->is_raw_stream = false;
+			cxd2878_set_j183(adapter->fe, false);
 			ret = cxd2878_tune_isdbc(adapter->fe, base_freq_hz, 0, true);
 			if (ret)
 				return ret;
@@ -333,6 +350,8 @@ static int tbs6281_set_channel(struct tbsecp3_adapter *adapter,
 				return ret;
 			tbs6281_wait_lock(adapter->fe, 700);
 		}
+		// 選局完了後に生ストリーム判定フラグを更新
+		adapter->is_raw_stream = cxd2878_is_j183(adapter->fe);
 		return 0;
 	}
 

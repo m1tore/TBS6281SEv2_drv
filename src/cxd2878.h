@@ -83,4 +83,10 @@ int cxd2878_dump_isdbc_banks(struct cxd2878_dev *dev, u8 *buf);
 // 復調器レジスタの直接読み書き関数
 int cxd2878_reg_rw(struct cxd2878_dev *dev, u8 bank, u8 reg, u8 *val, bool is_write);
 
+// J.183または生ストリームモード判定関数
+bool cxd2878_is_j183(struct cxd2878_dev *dev);
+
+// J.183または生ストリームモード設定関数
+void cxd2878_set_j183(struct cxd2878_dev *dev, bool enable);
+
 #endif

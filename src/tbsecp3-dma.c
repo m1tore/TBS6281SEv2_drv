@@ -8,6 +8,11 @@ static unsigned int dma_pkts[TBSECP3_MAX_ADAPTERS] = { 128, 128 };
 module_param_array(dma_pkts, uint, NULL, 0444);
 MODULE_PARM_DESC(dma_pkts, "DMA buffer size in TS packets from 16 to 256, default 128");
 
+// FPGA DMA生データ受信制御レジスタ値モジュールパラメータ
+static int dma_tlv_unk = 0;
+module_param(dma_tlv_unk, int, 0644);
+MODULE_PARM_DESC(dma_tlv_unk, "FPGA DMA TLV register value for 0x0014");
+
 #define TS_PACKET_SIZE		188
 
 // 受信TSパケットをDMAバッファから取り出してリングバッファへ渡すタスクレット
@@ -34,25 +39,31 @@ static void tbsecp3_dma_tasklet(unsigned long adap)
 		while (read_buffer != next_buffer) {
 			data = adapter->dma.buf[read_buffer];
 
-			// TSヘッダー同期バイトの位置合わせ処理
-			if (unlikely(data[adapter->dma.offset] != 0x47)) {
-				for (i = 0; i < TS_PACKET_SIZE; i++) {
-					if ((data[i] == 0x47) &&
-					    (data[i + TS_PACKET_SIZE] == 0x47) &&
-					    (data[i + 2 * TS_PACKET_SIZE] == 0x47) &&
-					    (data[i + 3 * TS_PACKET_SIZE] == 0x47)) {
-						adapter->dma.offset = i;
-						break;
+			// ストリーム種別に応じた同期位置合わせ処理
+			if (adapter->is_raw_stream || (adapter->fe && cxd2878_is_j183(adapter->fe))) {
+				// J.183およびTLV生ストリーム時は同期補正をバイパスする
+				adapter->dma.offset = 0;
+			} else {
+				// TSヘッダー同期バイトの位置合わせ処理
+				if (unlikely(data[adapter->dma.offset] != 0x47)) {
+					for (i = 0; i < TS_PACKET_SIZE; i++) {
+						if ((data[i] == 0x47) &&
+						    (data[i + TS_PACKET_SIZE] == 0x47) &&
+						    (data[i + 2 * TS_PACKET_SIZE] == 0x47) &&
+						    (data[i + 3 * TS_PACKET_SIZE] == 0x47)) {
+							adapter->dma.offset = i;
+							break;
+						}
 					}
 				}
-			}
 
-			// 同期オフセットが存在する場合は先頭ポインタを補正
-			if (unlikely(adapter->dma.offset != 0)) {
-				data += adapter->dma.offset;
-				if (read_buffer == (TBSECP3_DMA_BUFFERS - 1)) {
-					memcpy(adapter->dma.buf[TBSECP3_DMA_BUFFERS],
-					       adapter->dma.buf[0], adapter->dma.offset);
+				// 同期オフセットが存在する場合は先頭ポインタを補正
+				if (unlikely(adapter->dma.offset != 0)) {
+					data += adapter->dma.offset;
+					if (read_buffer == (TBSECP3_DMA_BUFFERS - 1)) {
+						memcpy(adapter->dma.buf[TBSECP3_DMA_BUFFERS],
+						       adapter->dma.buf[0], adapter->dma.offset);
+					}
 				}
 			}
 
@@ -78,6 +89,8 @@ void tbsecp3_dma_enable(struct tbsecp3_adapter *adap)
 	adap->dma.offset = 0;
 	adap->dma.cnt = 0;
 	adap->dma.next_buffer = 0;
+	if (dma_tlv_unk >= 0)
+		tbs_write(adap->dma.base, TBSECP3_DMA_TLV_UNK, (u32)dma_tlv_unk);
 	tbs_read(adap->dma.base, TBSECP3_DMA_STAT);
 	tbs_write(TBSECP3_INT_BASE, TBSECP3_DMA_IE(adap->cfg->ts_in), 1);
 	tbs_write(adap->dma.base, TBSECP3_DMA_EN, 1);
@@ -105,6 +118,8 @@ void tbsecp3_dma_reg_init(struct tbsecp3_dev *dev)
 
 	for (i = 0; i < dev->info->adapters; i++) {
 		tbs_write(adapter->dma.base, TBSECP3_DMA_EN, 0);
+		if (dma_tlv_unk >= 0)
+			tbs_write(adapter->dma.base, TBSECP3_DMA_TLV_UNK, (u32)dma_tlv_unk);
 		tbs_write(adapter->dma.base, TBSECP3_DMA_ADDRH,
 			  upper_32_bits(adapter->dma.dma_addr));
 		tbs_write(adapter->dma.base, TBSECP3_DMA_ADDRL,

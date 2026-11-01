@@ -102,7 +102,7 @@ i2c_xfer_exit:
 // サポートするI2C機能フラグを返却する関数
 static u32 i2c_functionality(struct i2c_adapter *adap)
 {
-	return I2C_FUNC_SMBUS_EMUL;
+	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
 }
 
 // I2Cバスアルゴリズム構造体
