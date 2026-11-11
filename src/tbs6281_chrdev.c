@@ -79,27 +79,16 @@ size_t tbs6281_ringbuffer_write(struct tbs6281_ringbuffer *rb,
 	return len;
 }
 
-// 復調器のロック完了を待機し安定化するヘルパー関数
+// 復調器のロック完了を適応的フィードバック制御で待機する関数
 static bool tbs6281_wait_lock(struct cxd2878_dev *fe, int timeout_ms)
 {
-	int elapsed = 0;
-	int regs = 0;
 	bool is_locked = false;
 
-	while (elapsed < timeout_ms) {
-		if (cxd2878_read_status(fe, &is_locked) == 0 && is_locked) {
-			msleep(80);
-			return true;
-		}
-		if (elapsed == 300 && timeout_ms == 700) {
-			// QAM同期検出時はTS同期完了まで待機時間を延長する
-			if (cxd2878_read_isdbc_regs(fe, &regs) == 0 && ((regs >> 16) & 0x01))
-				timeout_ms = 1500;
-		}
-		usleep_range(8000, 10000);
-		elapsed += 10;
-	}
-	return false;
+	if (!fe)
+		return false;
+
+	cxd2878_adaptive_monitor_and_lock(fe, timeout_ms, &is_locked);
+	return is_locked;
 }
 
 // キャラクタデバイスのオープン処理
@@ -256,6 +245,13 @@ static int tbs6281_set_channel(struct tbsecp3_adapter *adapter,
 	if (freq->freq_no >= 63 && freq->freq_no <= 112) {
 		// UHF地上波およびスーパーハイパーバンド13chから62chの選局処理
 		base_freq_hz = (473 + (freq->freq_no - 63) * 6) * 1000000U;
+		if (freq->slot == -2) {
+			// UHF帯における生ストリームモードによる選局
+			adapter->is_raw_stream = true;
+			cxd2878_set_j183(adapter->fe, true);
+			ret = cxd2878_tune_isdbc(adapter->fe, base_freq_hz, 0, true);
+			goto wait_lock_uhf;
+		}
 		if (freq->slot == 0) {
 			// 標準周波数オフセットでISDB-T地上波を選局する
 			ret = cxd2878_tune_isdbt(adapter->fe, base_freq_hz + 142857U);
@@ -288,6 +284,7 @@ static int tbs6281_set_channel(struct tbsecp3_adapter *adapter,
 				return ret;
 			tbs6281_wait_lock(adapter->fe, 700);
 		}
+wait_lock_uhf:
 		// 選局完了後に生ストリーム判定フラグを更新
 		adapter->is_raw_stream = cxd2878_is_j183(adapter->fe);
 		return 0;
@@ -327,9 +324,8 @@ static int tbs6281_set_channel(struct tbsecp3_adapter *adapter,
 		} else if (freq->slot > 10000000) {
 			// 直接指定された周波数でISDB-C選局
 			u32 direct_freq = (u32)freq->slot;
-
-			adapter->is_raw_stream = false;
-			cxd2878_set_j183(adapter->fe, false);
+			bool keep_raw = adapter->is_raw_stream || cxd2878_is_j183(adapter->fe);
+			cxd2878_set_j183(adapter->fe, keep_raw);
 			ret = cxd2878_tune_isdbc(adapter->fe, direct_freq, 0, true);
 			if (ret)
 				return ret;
@@ -485,6 +481,15 @@ static long tbs6281_chrdev_ioctl(struct file *file,
 			break;
 		if (copy_to_user((void __user *)arg, rargs, 4))
 			ret = -EFAULT;
+		break;
+	}
+
+	// Tuner RF gain dynamic control
+	case _IOW(0x8d, 0x24, int):
+	case _IO(0x8d, 0x24):
+	{
+		int gain = (int)arg;
+		ret = cxd2878_set_rf_gain(adapter->fe, gain);
 		break;
 	}
 

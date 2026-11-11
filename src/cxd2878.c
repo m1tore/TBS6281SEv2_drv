@@ -26,6 +26,17 @@ struct cxd_base {
 	const struct cxd2878_config *config;
 };
 
+#define CXD2878_TUNE_CACHE_SIZE 32
+struct cxd2878_tune_cache_entry {
+	u32 freq_khz;
+	int rf_gain;
+	u8 if_gc;
+	int fif_offset;
+	u8 bbagc_target;
+	u16 snr_raw;
+	bool valid;
+};
+
 struct cxd2878_dev {
 	struct cxd_base *base;
 	bool warm;
@@ -41,41 +52,59 @@ struct cxd2878_dev {
 	u32 current_freq_hz;
 	u16 isdbc_tsmf_slot;
 	bool isdbc_256qam_pass;
+	u8 bbagc_target;
+	const u8 *itb_coef;
+	int manual_rf_gain;
+	u8 dynamic_if_gc;
+	int dynamic_rf_gain;
+	int dynamic_fif_offset;
+	u8 dynamic_bbagc_target;
+	struct cxd2878_tune_cache_entry tune_cache[CXD2878_TUNE_CACHE_SIZE];
+	int tune_cache_count;
 	// 実験用生ストリームモードフラグ
 	bool is_j183;
 };
 
-// ISDB-CおよびISDB-T復調微調整用モジュールパラメータ群
+// 復調調整用モジュールパラメータ群
 static int isdbc_offset_khz = 0;
 module_param(isdbc_offset_khz, int, 0644);
 MODULE_PARM_DESC(isdbc_offset_khz, "ISDB-C frequency offset in kHz, default 0");
-static int isdbc_fif_offset = -6;
+static int isdbc_fif_offset = 999;
 module_param(isdbc_fif_offset, int, 0644);
-static int isdbc_bw_offset = -4;
+MODULE_PARM_DESC(isdbc_fif_offset, "ISDB-C FIF offset, default 999 for dynamic auto");
+static int isdbc_bw_offset = 999;
 module_param(isdbc_bw_offset, int, 0644);
-static int isdbc_if_gc = 0;
+MODULE_PARM_DESC(isdbc_bw_offset, "ISDB-C BW offset, default 999 for dynamic auto");
+static int isdbc_if_gc = -1;
 module_param(isdbc_if_gc, int, 0644);
-static int isdbc_bbagc_target = 0x28;
+MODULE_PARM_DESC(isdbc_if_gc, "ISDB-C IF gain, default -1 for dynamic auto");
+static int isdbc_bbagc_target = -1;
 module_param(isdbc_bbagc_target, int, 0644);
-static int isdbc_lower_local = 1;
+MODULE_PARM_DESC(isdbc_bbagc_target, "ISDB-C BBAGC target, default -1 for dynamic auto");
+static int isdbc_lower_local = -1;
 module_param(isdbc_lower_local, int, 0644);
+MODULE_PARM_DESC(isdbc_lower_local, "ISDB-C lower local, default -1 for dynamic auto");
 static int isdbc_rf_gain = -1;
 module_param(isdbc_rf_gain, int, 0644);
+MODULE_PARM_DESC(isdbc_rf_gain, "ISDB-C RF gain, default -1 for dynamic auto");
 static int isdbc_rfovld = -1;
 module_param(isdbc_rfovld, int, 0644);
 static int isdbc_ifovld = -1;
 module_param(isdbc_ifovld, int, 0644);
-static int isdbc_outlmt = 1;
+static int isdbc_outlmt = -1;
 module_param(isdbc_outlmt, int, 0644);
+MODULE_PARM_DESC(isdbc_outlmt, "ISDB-C output limit, default -1 for dynamic auto");
+static int isdbc_qam_mask = 0x1F;
+module_param(isdbc_qam_mask, int, 0644);
 static int isdbc_terr_tune = 0;
 module_param(isdbc_terr_tune, int, 0644);
-static int isdbt_lower_local = 0;
+static int isdbt_lower_local = -1;
 module_param(isdbt_lower_local, int, 0644);
-static int isdbt_fif_offset = -9;
+static int isdbt_fif_offset = 999;
 module_param(isdbt_fif_offset, int, 0644);
-static int isdbt_bw_offset = -5;
+static int isdbt_bw_offset = 999;
 module_param(isdbt_bw_offset, int, 0644);
-static int isdbt_if_gc = 8;
+static int isdbt_if_gc = -1;
 module_param(isdbt_if_gc, int, 0644);
 static int isdbt_rf_gain = -1;
 module_param(isdbt_rf_gain, int, 0644);
@@ -83,6 +112,9 @@ static int isdbt_rfovld = -1;
 module_param(isdbt_rfovld, int, 0644);
 static int isdbt_ifovld = -1;
 module_param(isdbt_ifovld, int, 0644);
+static int isdbt_bbagc_target = -1;
+module_param(isdbt_bbagc_target, int, 0644);
+MODULE_PARM_DESC(isdbt_bbagc_target, "ISDB-T BBAGC target, default -1 for dynamic auto");
 
 // ASCOT3チューナー用調整パラメータテーブル
 static const struct sony_ascot3_adjust_param_t g_param_table_ascot3i[SONY_ASCOT3_TV_SYSTEM_NUM] = {
@@ -321,10 +353,139 @@ static int cxd2878_i2c_repeater(struct cxd2878_dev *dev, bool enable)
 	return 0;
 }
 
+// 日本のCATV向けARIB 6MHzナイキスト補間フィルタ正規係数
+static const u8 isdbc_itb_coef_6[14] = {
+	0x31, 0xA8, 0x29, 0x9B, 0x27, 0x9C, 0x28, 0x9E, 0x29, 0xA4, 0x29, 0xA2, 0x29, 0xA8
+};
+
+// 日本のCATV 6MHz向け標準シンボルレート探索範囲設定値
+static const u8 isdbc_symrate_6[4] = {
+	0x07, 0x33, 0x00, 0xEE
+};
+
+// 動的チューニングパラメータ構造体
+struct cxd2878_dynamic_tune_params {
+	u8 lower_local;
+	u8 outlmt;
+	int rf_gain;
+	u8 if_gc;
+	int fif_offset;
+	int bw_offset;
+	u8 bbagc_target;
+	const u8 *itb_coef;
+};
+
+// チューニング学習キャッシュを検索する関数
+static int cxd2878_find_cache(struct cxd2878_dev *dev, u32 freq_khz)
+{
+	int i;
+
+	if (!dev)
+		return -1;
+	for (i = 0; i < dev->tune_cache_count && i < CXD2878_TUNE_CACHE_SIZE; i++) {
+		if (dev->tune_cache[i].valid && dev->tune_cache[i].freq_khz == freq_khz)
+			return i;
+	}
+	return -1;
+}
+
+// チューニング学習キャッシュを更新する関数
+static void cxd2878_update_cache(struct cxd2878_dev *dev, u32 freq_khz,
+				 int rf_gain, u8 if_gc, int fif_offset,
+				 u8 bbagc_target, u16 snr_raw)
+{
+	int idx;
+
+	if (!dev)
+		return;
+
+	idx = cxd2878_find_cache(dev, freq_khz);
+	if (idx < 0) {
+		if (dev->tune_cache_count < CXD2878_TUNE_CACHE_SIZE)
+			idx = dev->tune_cache_count++;
+		else
+			idx = (freq_khz / 1000) % CXD2878_TUNE_CACHE_SIZE;
+	}
+	dev->tune_cache[idx].freq_khz = freq_khz;
+	dev->tune_cache[idx].rf_gain = rf_gain;
+	dev->tune_cache[idx].if_gc = if_gc;
+	dev->tune_cache[idx].fif_offset = fif_offset;
+	dev->tune_cache[idx].bbagc_target = bbagc_target;
+	dev->tune_cache[idx].snr_raw = snr_raw;
+	dev->tune_cache[idx].valid = true;
+}
+
+// 周波数およびシステムに応じたチューナー最適パラメータの動的算出関数
+static void cxd2878_calc_dynamic_params(struct cxd2878_dev *dev,
+					enum sony_ascot3_tv_system_t aSystem,
+					u32 freq_khz,
+					struct cxd2878_dynamic_tune_params *p)
+{
+	if (aSystem == SONY_ASCOT3_DTV_DVBC_6) {
+		int cache_idx = cxd2878_find_cache(dev, freq_khz);
+
+		p->lower_local = (isdbc_lower_local >= 0) ? (u8)(isdbc_lower_local & 0x01) : 1;
+		p->outlmt = (isdbc_outlmt >= 0) ? (u8)(isdbc_outlmt & 0x03) : 0;
+		p->itb_coef = isdbc_itb_coef_6;
+
+		if (cache_idx >= 0) {
+			p->rf_gain = (dev->manual_rf_gain >= 0) ? dev->manual_rf_gain : dev->tune_cache[cache_idx].rf_gain;
+			p->if_gc = (isdbc_if_gc >= 0) ? (u8)(isdbc_if_gc & 0x0F) : dev->tune_cache[cache_idx].if_gc;
+			p->fif_offset = (isdbc_fif_offset != 999) ? isdbc_fif_offset : dev->tune_cache[cache_idx].fif_offset;
+			p->bbagc_target = (isdbc_bbagc_target >= 0) ? (u8)(isdbc_bbagc_target & 0xFF) : dev->tune_cache[cache_idx].bbagc_target;
+			p->bw_offset = (isdbc_bw_offset != 999) ? isdbc_bw_offset : -4;
+		} else {
+			if (freq_khz < 330000) {
+				// 低域弱電界帯域向け初期設定
+				p->if_gc = (isdbc_if_gc >= 0) ? (u8)(isdbc_if_gc & 0x0F) : 6;
+				p->bbagc_target = (isdbc_bbagc_target >= 0) ? (u8)(isdbc_bbagc_target & 0xFF) : 0x50;
+				p->rf_gain = (dev->manual_rf_gain >= 0) ? dev->manual_rf_gain : ((isdbc_rf_gain >= 0) ? isdbc_rf_gain : -1);
+			} else if (freq_khz <= 395000) {
+				// 中域安定帯域向け初期設定
+				p->if_gc = (isdbc_if_gc >= 0) ? (u8)(isdbc_if_gc & 0x0F) : 4;
+				p->bbagc_target = (isdbc_bbagc_target >= 0) ? (u8)(isdbc_bbagc_target & 0xFF) : 0x48;
+				p->rf_gain = (dev->manual_rf_gain >= 0) ? dev->manual_rf_gain : ((isdbc_rf_gain >= 0) ? isdbc_rf_gain : -1);
+			} else {
+				// 高域歪み警戒帯域向け初期設定
+				p->if_gc = (isdbc_if_gc >= 0) ? (u8)(isdbc_if_gc & 0x0F) : 2;
+				p->bbagc_target = (isdbc_bbagc_target >= 0) ? (u8)(isdbc_bbagc_target & 0xFF) : 0x44;
+				p->rf_gain = (dev->manual_rf_gain >= 0) ? dev->manual_rf_gain : ((isdbc_rf_gain >= 0) ? isdbc_rf_gain : -1);
+			}
+			p->fif_offset = (isdbc_fif_offset != 999) ? isdbc_fif_offset : -6;
+			p->bw_offset = (isdbc_bw_offset != 999) ? isdbc_bw_offset : -4;
+		}
+		dev->dynamic_if_gc = p->if_gc;
+		dev->dynamic_rf_gain = p->rf_gain;
+		dev->dynamic_fif_offset = p->fif_offset;
+		dev->dynamic_bbagc_target = p->bbagc_target;
+	} else if (aSystem == SONY_ASCOT3_DTV_ISDBT_6) {
+		// 日本の地上デジタル向け動的最適化パラメータ
+		p->lower_local = (isdbt_lower_local >= 0) ? (u8)(isdbt_lower_local & 0x01) : 0;
+		p->outlmt = 0;
+		p->rf_gain = (dev->manual_rf_gain >= 0) ? dev->manual_rf_gain : ((isdbt_rf_gain >= 0) ? isdbt_rf_gain : -1);
+		p->if_gc = (isdbt_if_gc >= 0) ? (u8)(isdbt_if_gc & 0x0F) : 8;
+		p->fif_offset = (isdbt_fif_offset != 999) ? isdbt_fif_offset : -9;
+		p->bw_offset = (isdbt_bw_offset != 999) ? isdbt_bw_offset : -5;
+		p->bbagc_target = (isdbt_bbagc_target >= 0) ? (u8)(isdbt_bbagc_target & 0xFF) : 0x50;
+		p->itb_coef = NULL;
+	} else {
+		// その他標準システム向けパラメータ
+		p->lower_local = (u8)(g_param_table_ascot3i[aSystem].IS_LOWERLOCAL & 0x01);
+		p->outlmt = (u8)(g_param_table_ascot3i[aSystem].OUTLMT & 0x03);
+		p->rf_gain = (g_param_table_ascot3i[aSystem].RF_GAIN == AUTO) ? -1 : g_param_table_ascot3i[aSystem].RF_GAIN;
+		p->if_gc = (u8)(g_param_table_ascot3i[aSystem].IF_BPF_GC & 0x0F);
+		p->fif_offset = g_param_table_ascot3i[aSystem].FIF_OFFSET;
+		p->bw_offset = g_param_table_ascot3i[aSystem].BW_OFFSET;
+		p->bbagc_target = 128;
+		p->itb_coef = NULL;
+	}
+}
+
 // ASCOT3チューナー周波数選局処理
 static int ascot3_tune(struct cxd2878_dev *dev, u32 frequency)
 {
 	enum sony_ascot3_tv_system_t aSystem;
+	struct cxd2878_dynamic_tune_params dyn;
 	u8 cdata[2] = { 0xC4, 0x40 };
 	u8 data[2];
 	u8 data1[2];
@@ -428,13 +589,16 @@ static int ascot3_tune(struct cxd2878_dev *dev, u32 frequency)
 	}
 	cxd2878_wrm(dev, dev->tuner_addr, 0x91, data, 2);
 
+	cxd2878_calc_dynamic_params(dev, aSystem, frequency, &dyn);
+	dev->bbagc_target = dyn.bbagc_target;
+	dev->itb_coef = dyn.itb_coef;
+	dev_info(&dev->base->i2c->dev,
+		 "%s: dyn tune sys=%d freq=%u kHz: lower_local=%u if_gc=%u fif=%d bw=%d bbagc=%u rf_gain=%d\n",
+		 KBUILD_MODNAME, aSystem, frequency,
+		 dyn.lower_local, dyn.if_gc, dyn.fif_offset, dyn.bw_offset, dyn.bbagc_target, dyn.rf_gain);
+
 	data1[0] = 0x00;
-	if (isdbc_lower_local >= 0 && aSystem == SONY_ASCOT3_DTV_DVBC_6)
-		data1[1] = (u8)(isdbc_lower_local & 0x01);
-	else if (isdbt_lower_local >= 0 && aSystem == SONY_ASCOT3_DTV_ISDBT_6)
-		data1[1] = (u8)(isdbt_lower_local & 0x01);
-	else
-		data1[1] = (u8)(g_param_table_ascot3i[aSystem].IS_LOWERLOCAL & 0x01);
+	data1[1] = (u8)(dyn.lower_local & 0x01);
 	cxd2878_wrm(dev, dev->tuner_addr, 0x9c, data1, 2);
 
 	data2[0] = 0xEE;
@@ -496,24 +660,13 @@ static int ascot3_tune(struct cxd2878_dev *dev, u32 frequency)
 	cxd2878_wrm(dev, dev->tuner_addr, 0x5E, data2, 9);
 	cxd2878_SetRegisterBits(dev, dev->tuner_addr, 0x67, 0x00, 0x06);
 
-	if (aSystem == SONY_ASCOT3_DTV_DVBC_6 && isdbc_outlmt >= 0)
-		data3[0] = (u8)(isdbc_outlmt & 0x03);
+	data3[0] = (u8)(dyn.outlmt & 0x03);
+	if (dyn.rf_gain >= 0)
+		data3[1] = (u8)((dyn.rf_gain << 4) & 0x70);
 	else
-		data3[0] = g_param_table_ascot3i[aSystem].OUTLMT & 0x03;
-	if (aSystem == SONY_ASCOT3_DTV_ISDBT_6 && isdbt_rf_gain >= 0)
-		data3[1] = (u8)((isdbt_rf_gain << 4) & 0x70);
-	else if (aSystem == SONY_ASCOT3_DTV_DVBC_6 && isdbc_rf_gain >= 0)
-		data3[1] = (u8)((isdbc_rf_gain << 4) & 0x70);
-	else if (g_param_table_ascot3i[aSystem].RF_GAIN == AUTO)
 		data3[1] = 0x80;
-	else
-		data3[1] = (u8)((g_param_table_ascot3i[aSystem].RF_GAIN << 4) & 0x70);
 
-	data3[1] |= (u8)(g_param_table_ascot3i[aSystem].IF_BPF_GC & 0x0F);
-	if (aSystem == SONY_ASCOT3_DTV_DVBC_6)
-		data3[1] = (data3[1] & 0xF0) | (u8)(isdbc_if_gc & 0x0F);
-	else if (aSystem == SONY_ASCOT3_DTV_ISDBT_6)
-		data3[1] = (data3[1] & 0xF0) | (u8)(isdbt_if_gc & 0x0F);
+	data3[1] |= (u8)(dyn.if_gc & 0x0F);
 	data3[2] = 0x00;
 
 	if (frequency <= 172000) {
@@ -541,16 +694,8 @@ static int ascot3_tune(struct cxd2878_dev *dev, u32 frequency)
 
 	data3[5] = (u8)((g_param_table_ascot3i[aSystem].IF_BPF_F0 << 4) & 0x30);
 	data3[5] |= (u8)(g_param_table_ascot3i[aSystem].BW & 0x03);
-	if (aSystem == SONY_ASCOT3_DTV_DVBC_6) {
-		data3[6] = OFFSET(isdbc_fif_offset);
-		data3[7] = OFFSET(isdbc_bw_offset);
-	} else if (aSystem == SONY_ASCOT3_DTV_ISDBT_6) {
-		data3[6] = OFFSET(isdbt_fif_offset);
-		data3[7] = OFFSET(isdbt_bw_offset);
-	} else {
-		data3[6] = (u8)(g_param_table_ascot3i[aSystem].FIF_OFFSET & 0x1F);
-		data3[7] = (u8)(g_param_table_ascot3i[aSystem].BW_OFFSET & 0x1F);
-	}
+	data3[6] = OFFSET(dyn.fif_offset);
+	data3[7] = OFFSET(dyn.bw_offset);
 	data3[8] = (u8)(frequency & 0xFF);
 	data3[9] = (u8)((frequency >> 8) & 0xFF);
 	data3[10] = (u8)((frequency >> 16) & 0x0F);
@@ -1216,22 +1361,33 @@ static int cxd2878_sleep_unlocked(struct cxd2878_dev *dev)
 		case SONY_DTV_SYSTEM_ISDBT:
 		{
 			u8 data0[2] = { 0x01, 0x02 };
+			u8 nominalRate_def[5] = { 0x15, 0x00, 0x00, 0x00, 0x00 };
+			u8 dataxd9_def[2] = { 0x15, 0x28 };
 
 			cxd2878_wr(dev, dev->slvt, 0x00, 0x10);
 			cxd2878_wr(dev, dev->slvt, 0x69, 0x05);
 			cxd2878_wr(dev, dev->slvt, 0x6B, 0x07);
 			cxd2878_wr(dev, dev->slvt, 0x9D, 0x14);
+			cxd2878_wrm(dev, dev->slvt, 0x9F, nominalRate_def, 5);
 			cxd2878_wr(dev, dev->slvt, 0xD3, 0x00);
+			cxd2878_wr(dev, dev->slvt, 0xD7, 0x00);
+			cxd2878_wrm(dev, dev->slvt, 0xD9, dataxd9_def, 2);
 			cxd2878_wr(dev, dev->slvt, 0xED, 0x01);
 			cxd2878_wr(dev, dev->slvt, 0xE2, 0x4E);
 			cxd2878_wr(dev, dev->slvt, 0xF2, 0x03);
 			cxd2878_wr(dev, dev->slvt, 0xDE, 0x32);
+			cxd2878_wr(dev, dev->slvt, 0x00, 0x12);
+			cxd2878_wr(dev, dev->slvt, 0x71, 0x03);
 			cxd2878_wr(dev, dev->slvt, 0x00, 0x15);
+			cxd2878_wr(dev, dev->slvt, 0xBE, 0x03);
 			cxd2878_wr(dev, dev->slvt, 0xDE, 0x03);
 			cxd2878_wr(dev, dev->slvt, 0x00, 0x17);
 			cxd2878_wrm(dev, dev->slvt, 0x38, data0, 2);
 			cxd2878_wr(dev, dev->slvt, 0x00, 0x1E);
 			cxd2878_wr(dev, dev->slvt, 0x73, 0x00);
+			cxd2878_wr(dev, dev->slvt, 0x00, 0x60);
+			cxd2878_wr(dev, dev->slvt, 0xA8, 0x00);
+			cxd2878_wr(dev, dev->slvt, 0xA9, 0x00);
 			cxd2878_wr(dev, dev->slvt, 0x00, 0x63);
 			cxd2878_wr(dev, dev->slvt, 0x81, 0x01);
 			break;
@@ -1353,6 +1509,8 @@ static int SLtoAIT_BandSetting(struct cxd2878_dev *dev)
 		data[1] = (u8)((dev->iffreqConfig.configISDBT_6 >> 8) & 0xFF);
 		data[2] = (u8)(dev->iffreqConfig.configISDBT_6 & 0xFF);
 		cxd2878_wrm(dev, dev->slvt, 0xB6, data, 3);
+		// 復調器IFAGC設定を適用
+		cxd2878_SetRegisterBits(dev, dev->slvt, 0xD2, 0x0C, 0x1F);
 		cxd2878_wr(dev, dev->slvt, 0xD7, 0x04);
 		dataxd9[0] = 0x1F;
 		dataxd9[1] = 0x79;
@@ -1397,7 +1555,7 @@ static int SLtoAIT(struct cxd2878_dev *dev)
 	cxd2878_wr(dev, dev->slvx, 0x18, 0x00);
 
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x11);
-	cxd2878_wr(dev, dev->slvt, 0x6A, 0x50);
+	cxd2878_wr(dev, dev->slvt, 0x6A, dev->bbagc_target ? dev->bbagc_target : 0x50);
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x10);
 	cxd2878_wr(dev, dev->slvt, 0xA5, 0x01);
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
@@ -1443,39 +1601,37 @@ static int SLtoAIC_BandAndTSMFSetting(struct cxd2878_dev *dev)
 {
 	int ret = 0;
 	u8 data[3];
-// ARIB規格ISDB-CおよびDVB-C用ナイキスト補間フィルタ係数
-	u8 itbCoef_6[14] = {
-		0x2D, 0xC7, 0x04, 0xF4, 0x07, 0xC5, 0x2A, 0xB8, 0x27, 0x9E, 0x27, 0xA4, 0x29, 0xAB
-	};
-	u8 symRate_6[4] = {
-		0x07, 0x33, 0x00, 0xEE
-	};
 
 	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x10);
 	if (ret)
 		goto err;
 
-	cxd2878_wrm(dev, dev->slvt, 0xA6, itbCoef_6, 14);
+	// 動的ナイキスト補間フィルタ係数の適用
+	if (dev->itb_coef)
+		cxd2878_wrm(dev, dev->slvt, 0xA6, dev->itb_coef, 14);
+
 	data[0] = (u8)((dev->iffreqConfig.configDVBC_6 >> 16) & 0xFF);
 	data[1] = (u8)((dev->iffreqConfig.configDVBC_6 >> 8) & 0xFF);
 	data[2] = (u8)(dev->iffreqConfig.configDVBC_6 & 0xFF);
 	cxd2878_wrm(dev, dev->slvt, 0xB6, data, 3);
-	cxd2878_SetRegisterBits(dev, dev->slvt, 0xD2, 0x0B, 0x1F);
+	// 復調器IFAGC設定を適用
+	cxd2878_SetRegisterBits(dev, dev->slvt, 0xD2, 0x09, 0x1F);
 
+	// サンプリング分周を6MHz動作に設定
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x11);
 	cxd2878_wr(dev, dev->slvt, 0xA3, 0x14);
 
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x40);
-	// CATVおよび高度CATV向け標準シンボルレート設定
-	cxd2878_wrm(dev, dev->slvt, 0x26, symRate_6, 4);
+	// 6MHz標準シンボルレート探索範囲を設定
+	cxd2878_wrm(dev, dev->slvt, 0x26, isdbc_symrate_6, 4);
 
 	if (dev->isdbc_256qam_pass || dev->isdbc_tsmf_slot == 0) {
 		// 全QAM自動追従とTSMFスルー出力を設定
-		cxd2878_wr(dev, dev->slvt, 0x14, 0x14);
+		cxd2878_wr(dev, dev->slvt, 0x14, (u8)(isdbc_qam_mask & 0x1F));
 		cxd2878_wr(dev, dev->slvt, 0x1E, 0x00);
 	} else {
 		// ISDB-CのTSMFハードウェア分離を有効化
-		cxd2878_wr(dev, dev->slvt, 0x14, 0x14);
+		cxd2878_wr(dev, dev->slvt, 0x14, (u8)(isdbc_qam_mask & 0x1F));
 		cxd2878_wr(dev, dev->slvt, 0x1E, 0x80);
 		cxd2878_wr(dev, dev->slvt, 0x00, 0x49);
 		if (dev->isdbc_tsmf_slot < 16) {
@@ -1530,7 +1686,11 @@ static int SLtoAIC(struct cxd2878_dev *dev)
 	cxd2878_wr(dev, dev->slvt, 0x49, 0x00);
 	cxd2878_wr(dev, dev->slvx, 0x18, 0x00);
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x11);
-	cxd2878_wr(dev, dev->slvt, 0x6A, (u8)(isdbc_bbagc_target & 0xFF));
+	{
+		u8 bbagc = (isdbc_bbagc_target >= 0) ? (u8)(isdbc_bbagc_target & 0xFF) :
+			   (dev->bbagc_target ? dev->bbagc_target : 0x48);
+		cxd2878_wr(dev, dev->slvt, 0x6A, bbagc);
+	}
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x10);
 	cxd2878_wr(dev, dev->slvt, 0xA5, 0x01);
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x11);
@@ -1538,7 +1698,7 @@ static int SLtoAIC(struct cxd2878_dev *dev)
 	cxd2878_wrm(dev, dev->slvt, 0x33, datax33, 3);
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x48);
 	cxd2878_wr(dev, dev->slvt, 0x2C, 0x03);
-	// RSエラー発生時のTS出力ミュートゲートを解除してTSロックを維持
+	// RSエラー発生時もTS出力を継続
 	cxd2878_wr(dev, dev->slvt, 0xAC, 0x00);
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
 	cxd2878_wrm(dev, dev->slvt, 0xCE, dataxce, 2);
@@ -1697,6 +1857,14 @@ int cxd2878_tune_isdbt(struct cxd2878_dev *dev, u32 freq_hz)
 	dev->bandwidth = SONY_DTV_BW_6_MHZ;
 	dev->current_freq_hz = freq_hz;
 
+	// 動的チューニングパラメータの算出
+	{
+		struct cxd2878_dynamic_tune_params dyn;
+		cxd2878_calc_dynamic_params(dev, SONY_ASCOT3_DTV_ISDBT_6, freq_hz / 1000, &dyn);
+		dev->bbagc_target = dyn.bbagc_target;
+		dev->iffreqConfig.configISDBT_6 = SONY_DEMOD_MAKE_IFFREQ_CONFIG_KHZ(4000 + dyn.fif_offset * 50);
+	}
+
 	if (dev->state == SONY_DEMOD_STATE_ACTIVE && dev->system == SONY_DTV_SYSTEM_ISDBT) {
 		cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
 		cxd2878_wr(dev, dev->slvt, 0xC3, 0x01);
@@ -1766,6 +1934,15 @@ int cxd2878_tune_isdbc(struct cxd2878_dev *dev, u32 freq_hz,
 	dev->isdbc_tsmf_slot = tsmf_slot_or_tsid;
 	dev->isdbc_256qam_pass = is_256qam_pass;
 
+	// 選局周波数に応じた動的チューニングパラメータの先行算出
+	{
+		struct cxd2878_dynamic_tune_params dyn;
+		cxd2878_calc_dynamic_params(dev, SONY_ASCOT3_DTV_DVBC_6, freq_hz / 1000, &dyn);
+		dev->bbagc_target = dyn.bbagc_target;
+		dev->itb_coef = dyn.itb_coef;
+		dev->iffreqConfig.configDVBC_6 = SONY_DEMOD_MAKE_IFFREQ_CONFIG_KHZ(4000 + dyn.fif_offset * 50);
+	}
+
 	// ISDB-C標準復調選局
 	if (dev->state == SONY_DEMOD_STATE_ACTIVE && dev->system != SONY_DTV_SYSTEM_ISDBC)
 		cxd2878_sleep_unlocked(dev);
@@ -1773,7 +1950,7 @@ int cxd2878_tune_isdbc(struct cxd2878_dev *dev, u32 freq_hz,
 	dev->bandwidth = SONY_DTV_BW_6_MHZ;
 	if (dev->state == SONY_DEMOD_STATE_ACTIVE) {
 		ret |= cxd2878_setstreamoutput(dev, 0);
-		// アクティブ再選局時もRSエラー時のTS出力ゲート解除を適用
+		// 再選局時もRSエラーミュート解除を維持
 		cxd2878_wr(dev, dev->slvt, 0x00, 0x48);
 		cxd2878_wr(dev, dev->slvt, 0xAC, 0x00);
 		ret |= SLtoAIC_BandAndTSMFSetting(dev);
@@ -2192,6 +2369,12 @@ struct cxd2878_dev *cxd2878_attach(const struct cxd2878_config *config,
 		goto err2;
 	}
 	dev->chipid = id;
+	dev->manual_rf_gain = -1;
+	dev->dynamic_rf_gain = -1;
+	dev->dynamic_if_gc = 4;
+	dev->dynamic_fif_offset = -6;
+	dev->dynamic_bbagc_target = 0x48;
+	dev->tune_cache_count = 0;
 	return dev;
 
 err2:
@@ -2216,4 +2399,332 @@ void cxd2878_set_j183(struct cxd2878_dev *dev, bool enable)
 	if (dev)
 		dev->is_j183 = enable;
 }
+
+// チューナーRFゲインを動的設定する関数
+int cxd2878_set_rf_gain(struct cxd2878_dev *dev, int rf_gain)
+{
+	u8 val = 0;
+	int ret;
+
+	if (!dev)
+		return -EINVAL;
+
+	// 保持された手動RFゲインを更新
+	dev->manual_rf_gain = rf_gain;
+
+	mutex_lock(&dev->base->i2c_lock);
+	ret = cxd2878_i2c_repeater(dev, true);
+	if (ret)
+		goto out;
+
+	ret = cxd2878_rdm(dev, dev->tuner_addr, 0x69, &val, 1);
+	if (ret)
+		goto out;
+
+	if (rf_gain < 0) {
+		val |= 0x80;
+	} else {
+		val &= ~0x80;
+		val = (val & ~0x70) | (u8)((rf_gain << 4) & 0x70);
+	}
+	ret = cxd2878_wrm(dev, dev->tuner_addr, 0x69, &val, 1);
+	// チューナーレジスタのラッチを実行
+	cxd2878_wr(dev, dev->tuner_addr, 0x87, 0xC0);
+
+out:
+	cxd2878_i2c_repeater(dev, false);
+	mutex_unlock(&dev->base->i2c_lock);
+	return ret;
+}
+
+// 設定された手動RFゲインを取得する関数
+int cxd2878_get_manual_rf_gain(struct cxd2878_dev *dev)
+{
+	if (!dev)
+		return -EINVAL;
+	return dev->manual_rf_gain;
+}
+
+// チューナーIFゲインを即時適用する関数
+int cxd2878_apply_if_gc(struct cxd2878_dev *dev, u8 if_gc)
+{
+	u8 val = 0;
+	int ret;
+
+	if (!dev)
+		return -EINVAL;
+
+	dev->dynamic_if_gc = if_gc;
+	mutex_lock(&dev->base->i2c_lock);
+	ret = cxd2878_i2c_repeater(dev, true);
+	if (ret)
+		goto out;
+
+	ret = cxd2878_rdm(dev, dev->tuner_addr, 0x69, &val, 1);
+	if (!ret) {
+		val = (val & ~0x0F) | (if_gc & 0x0F);
+		ret = cxd2878_wrm(dev, dev->tuner_addr, 0x69, &val, 1);
+		ret |= cxd2878_wr(dev, dev->tuner_addr, 0x87, 0xC0);
+	}
+
+out:
+	cxd2878_i2c_repeater(dev, false);
+	mutex_unlock(&dev->base->i2c_lock);
+	return ret;
+}
+
+// ベースバンドAGC目標値を即時適用する関数
+int cxd2878_apply_bbagc_target(struct cxd2878_dev *dev, u8 target)
+{
+	int ret;
+
+	if (!dev)
+		return -EINVAL;
+
+	dev->bbagc_target = target;
+	dev->dynamic_bbagc_target = target;
+	mutex_lock(&dev->base->i2c_lock);
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x11);
+	if (!ret)
+		ret = cxd2878_wr(dev, dev->slvt, 0x6A, target);
+	mutex_unlock(&dev->base->i2c_lock);
+	return ret;
+}
+
+// 中間周波数オフセットを即時適用する関数
+int cxd2878_apply_fif_offset(struct cxd2878_dev *dev, int fif_offset)
+{
+	u8 data[3];
+	u32 if_freq;
+	int ret;
+
+	if (!dev)
+		return -EINVAL;
+
+	dev->dynamic_fif_offset = fif_offset;
+	mutex_lock(&dev->base->i2c_lock);
+	ret = cxd2878_i2c_repeater(dev, true);
+	if (ret)
+		goto out;
+
+	ret = cxd2878_wr(dev, dev->tuner_addr, 0x6E, (u8)OFFSET(fif_offset));
+	ret |= cxd2878_wr(dev, dev->tuner_addr, 0x87, 0xC0);
+	cxd2878_i2c_repeater(dev, false);
+
+	if (dev->system == SONY_DTV_SYSTEM_ISDBC || dev->system == SONY_DTV_SYSTEM_DVBC) {
+		if_freq = SONY_DEMOD_MAKE_IFFREQ_CONFIG_KHZ(4000 + fif_offset * 50);
+		dev->iffreqConfig.configDVBC_6 = if_freq;
+		data[0] = (u8)((if_freq >> 16) & 0xFF);
+		data[1] = (u8)((if_freq >> 8) & 0xFF);
+		data[2] = (u8)(if_freq & 0xFF);
+		ret |= cxd2878_wr(dev, dev->slvt, 0x00, 0x10);
+		ret |= cxd2878_wrm(dev, dev->slvt, 0xB6, data, 3);
+	}
+
+out:
+	mutex_unlock(&dev->base->i2c_lock);
+	return ret;
+}
+
+// チューナーRFゲインを即時適用する関数
+int cxd2878_apply_rf_gain(struct cxd2878_dev *dev, int rf_gain)
+{
+	u8 val = 0;
+	int ret;
+
+	if (!dev)
+		return -EINVAL;
+
+	dev->dynamic_rf_gain = rf_gain;
+	mutex_lock(&dev->base->i2c_lock);
+	ret = cxd2878_i2c_repeater(dev, true);
+	if (ret)
+		goto out;
+
+	ret = cxd2878_rdm(dev, dev->tuner_addr, 0x69, &val, 1);
+	if (!ret) {
+		if (rf_gain < 0) {
+			val |= 0x80;
+		} else {
+			val &= ~0x80;
+			val = (val & ~0x70) | (u8)((rf_gain << 4) & 0x70);
+		}
+		ret = cxd2878_wrm(dev, dev->tuner_addr, 0x69, &val, 1);
+		ret |= cxd2878_wr(dev, dev->tuner_addr, 0x87, 0xC0);
+	}
+
+out:
+	cxd2878_i2c_repeater(dev, false);
+	mutex_unlock(&dev->base->i2c_lock);
+	return ret;
+}
+
+// 復調器内部AGC生値を取得する関数
+int cxd2878_get_demod_agc(struct cxd2878_dev *dev, u16 *demod_agc)
+{
+	u8 data[2] = { 0, 0 };
+	int ret;
+
+	if (!dev || !demod_agc)
+		return -EINVAL;
+
+	mutex_lock(&dev->base->i2c_lock);
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x40);
+	if (!ret)
+		ret = cxd2878_rdm(dev, dev->slvt, 0x49, data, 2);
+	mutex_unlock(&dev->base->i2c_lock);
+
+	if (!ret)
+		*demod_agc = (((u16)data[0] & 0x0F) << 8) | (u16)data[1];
+	return ret;
+}
+
+// 復調器内部SNR生値を取得する関数
+int cxd2878_get_snr_raw(struct cxd2878_dev *dev, u16 *snr_raw)
+{
+	u8 data[2] = { 0, 0 };
+	int ret;
+
+	if (!dev || !snr_raw)
+		return -EINVAL;
+
+	mutex_lock(&dev->base->i2c_lock);
+	ret = cxd2878_wr(dev, dev->slvt, 0x01, 0x01);
+	ret |= cxd2878_wr(dev, dev->slvt, 0x00, 0x40);
+	if (!ret)
+		ret = cxd2878_rdm(dev, dev->slvt, 0x4C, data, 2);
+	cxd2878_wr(dev, dev->slvt, 0x01, 0x00);
+	mutex_unlock(&dev->base->i2c_lock);
+
+	if (!ret)
+		*snr_raw = (((u16)data[0] & 0x1F) << 8) | (u16)data[1];
+	return ret;
+}
+
+// 信号状態に応じた適応的フィードバック制御とロック待機を行う関数
+int cxd2878_adaptive_monitor_and_lock(struct cxd2878_dev *dev, int timeout_ms, bool *is_locked)
+{
+	int elapsed = 0;
+	int regs = 0;
+	u16 demod_agc = 0;
+	u16 best_snr_raw = 0xFFFF;
+	u16 snr_raw = 0;
+	bool locked = false;
+	int offset_step = 0;
+	static const int offset_trials[] = { -6, -5, -7, -4, -8 };
+
+	if (!dev || !is_locked)
+		return -EINVAL;
+
+	*is_locked = false;
+
+	if (dev->system != SONY_DTV_SYSTEM_ISDBC && dev->system != SONY_DTV_SYSTEM_DVBC) {
+		// 地デジなど非ケーブル時は標準ロック待機を実行
+		while (elapsed < timeout_ms) {
+			if (cxd2878_read_status(dev, &locked) == 0 && locked) {
+				*is_locked = true;
+				msleep(80);
+				return 0;
+			}
+			usleep_range(8000, 10000);
+			elapsed += 10;
+		}
+		return 0;
+	}
+
+	while (elapsed < timeout_ms) {
+		if (cxd2878_read_status(dev, &locked) == 0 && locked) {
+			// ロック完了時の変調判定
+			if (cxd2878_read_isdbc_regs(dev, &regs) == 0) {
+				if ((regs & 0x0F) == 0x04)
+					cxd2878_set_j183(dev, true);
+			}
+
+			// ロック成立後のSNR微細動的最適化
+			if (cxd2878_get_snr_raw(dev, &snr_raw) == 0 && snr_raw > 0) {
+				best_snr_raw = snr_raw;
+				if (cxd2878_get_demod_agc(dev, &demod_agc) == 0) {
+					// AGCがやや高い場合IFゲイン加算をテスト
+					if (demod_agc > 550 && dev->dynamic_if_gc < 8) {
+						u16 test_snr = 0;
+						u8 orig_if = dev->dynamic_if_gc;
+						cxd2878_apply_if_gc(dev, orig_if + 1);
+						usleep_range(15000, 20000);
+						if (cxd2878_get_snr_raw(dev, &test_snr) == 0 && test_snr < best_snr_raw) {
+							best_snr_raw = test_snr;
+						} else {
+							cxd2878_apply_if_gc(dev, orig_if);
+						}
+					}
+					// 高域の歪み帯域でSNR不足時はIF減衰をテスト
+					if (dev->current_freq_hz > 395000000U && best_snr_raw > 1800 && dev->dynamic_if_gc > 1) {
+						u16 test_snr = 0;
+						u8 orig_if = dev->dynamic_if_gc;
+						cxd2878_apply_if_gc(dev, orig_if - 1);
+						usleep_range(15000, 20000);
+						if (cxd2878_get_snr_raw(dev, &test_snr) == 0 && test_snr < best_snr_raw) {
+							best_snr_raw = test_snr;
+						} else {
+							cxd2878_apply_if_gc(dev, orig_if);
+						}
+					}
+				}
+			}
+
+			// 学習キャッシュへ最適パラメータを記録
+			cxd2878_update_cache(dev, dev->current_freq_hz / 1000,
+					     dev->dynamic_rf_gain, dev->dynamic_if_gc,
+					     dev->dynamic_fif_offset, dev->dynamic_bbagc_target,
+					     best_snr_raw);
+
+			*is_locked = true;
+			msleep(40);
+			return 0;
+		}
+
+		// 未ロック時の動的フィードバック制御
+		if (elapsed == 150) {
+			if (cxd2878_get_demod_agc(dev, &demod_agc) == 0) {
+				if (demod_agc > 700) {
+					// 入力信号過小時のゲイン引き上げ
+					cxd2878_apply_if_gc(dev, min((int)dev->dynamic_if_gc + 2, 10));
+					cxd2878_apply_bbagc_target(dev, 0x50);
+				} else if (demod_agc < 200) {
+					// 入力信号過大時のゲイン引き下げ
+					cxd2878_apply_if_gc(dev, max((int)dev->dynamic_if_gc - 2, 1));
+					cxd2878_apply_bbagc_target(dev, 0x44);
+				}
+			}
+		}
+
+		if (elapsed >= 300) {
+			if (cxd2878_read_isdbc_regs(dev, &regs) == 0) {
+				// QAM同期検出中は待機時間を延長
+				if ((regs & 0x80) || ((regs >> 16) & 0x01))
+					timeout_ms = max(timeout_ms, 2000);
+
+				if ((regs & 0x0F) == 0x04)
+					cxd2878_set_j183(dev, true);
+			}
+
+			// キャリア引き込み未完了時の周波数偏差探索
+			if ((elapsed % 200) == 0 && offset_step < ARRAY_SIZE(offset_trials)) {
+				int trial_fif = offset_trials[offset_step++];
+				if (trial_fif != dev->dynamic_fif_offset) {
+					cxd2878_apply_fif_offset(dev, trial_fif);
+					// 弱電界帯域で自律AGCが過減衰している場合は最大ゲインを試行
+					if (dev->current_freq_hz < 330000000U && dev->dynamic_rf_gain < 0)
+						cxd2878_apply_rf_gain(dev, 0);
+				}
+			}
+		}
+
+		usleep_range(10000, 15000);
+		elapsed += 15;
+	}
+
+	return 0;
+}
+
+
 

@@ -86,7 +86,34 @@ int cxd2878_reg_rw(struct cxd2878_dev *dev, u8 bank, u8 reg, u8 *val, bool is_wr
 // J.183または生ストリームモード判定関数
 bool cxd2878_is_j183(struct cxd2878_dev *dev);
 
+// チューナーRFゲインを動的設定する関数
+int cxd2878_set_rf_gain(struct cxd2878_dev *dev, int rf_gain);
+
+// 設定された手動RFゲインを取得する関数
+int cxd2878_get_manual_rf_gain(struct cxd2878_dev *dev);
+
 // J.183または生ストリームモード設定関数
 void cxd2878_set_j183(struct cxd2878_dev *dev, bool enable);
+
+// 復調器内部AGC生値を取得する関数
+int cxd2878_get_demod_agc(struct cxd2878_dev *dev, u16 *demod_agc);
+
+// 復調器内部SNR生値を取得する関数
+int cxd2878_get_snr_raw(struct cxd2878_dev *dev, u16 *snr_raw);
+
+// チューナーIFゲインを即時適用する関数
+int cxd2878_apply_if_gc(struct cxd2878_dev *dev, u8 if_gc);
+
+// ベースバンドAGC目標値を即時適用する関数
+int cxd2878_apply_bbagc_target(struct cxd2878_dev *dev, u8 target);
+
+// 中間周波数オフセットを即時適用する関数
+int cxd2878_apply_fif_offset(struct cxd2878_dev *dev, int fif_offset);
+
+// チューナーRFゲインを即時適用する関数
+int cxd2878_apply_rf_gain(struct cxd2878_dev *dev, int rf_gain);
+
+// 信号状態に応じた適応的フィードバック制御とロック待機を行う関数
+int cxd2878_adaptive_monitor_and_lock(struct cxd2878_dev *dev, int timeout_ms, bool *is_locked);
 
 #endif

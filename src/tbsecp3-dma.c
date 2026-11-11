@@ -4,9 +4,9 @@
 #include "tbsecp3.h"
 
 // アダプタごとのDMA転送パケット数設定モジュールパラメータ
-static unsigned int dma_pkts[TBSECP3_MAX_ADAPTERS] = { 128, 128 };
+static unsigned int dma_pkts[TBSECP3_MAX_ADAPTERS] = { 256, 256 };
 module_param_array(dma_pkts, uint, NULL, 0444);
-MODULE_PARM_DESC(dma_pkts, "DMA buffer size in TS packets from 16 to 256, default 128");
+MODULE_PARM_DESC(dma_pkts, "DMA buffer size in TS packets from 16 to 256, default 256");
 
 // FPGA DMA生データ受信制御レジスタ値モジュールパラメータ
 static int dma_tlv_unk = 0;
